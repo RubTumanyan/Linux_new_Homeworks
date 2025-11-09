@@ -1,87 +1,87 @@
 #include <iostream>
-#include <string>
-#include <vector>
 #include <sstream>
-#include <cstring>
-#include <cstdlib>
+#include <vector>
+#include <string>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
-#include <limits.h>
+#include <cstdlib>
 
-static void split_tokens(const std::string &line, std::vector<std::string> &out) {
-    std::istringstream iss(line);
-    std::string tok;
-    while (iss >> tok) out.push_back(tok);
+void execute_command(const std::vector<std::string>& args, bool silent=false, const std::string& outfile="", bool append=false) {
+    pid_t pid = fork();
+    if (pid < 0) return;
+    else if (pid == 0) {
+        const char* old_path = getenv("PATH");
+        std::string new_path = ".";
+        if (old_path) new_path += ":" + std::string(old_path);
+        setenv("PATH", new_path.c_str(), 1);
+
+        int fd = -1;
+        if (silent) {
+            std::string log_file = std::to_string(getpid()) + ".log";
+            fd = open(log_file.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+            if (fd >= 0) { dup2(fd, STDOUT_FILENO); dup2(fd, STDERR_FILENO); close(fd); }
+        } else if (!outfile.empty()) {
+            int flags = O_CREAT | O_WRONLY | (append ? O_APPEND : O_TRUNC);
+            fd = open(outfile.c_str(), flags, 0644);
+            if (fd >= 0) { dup2(fd, STDOUT_FILENO); close(fd); }
+        }
+
+        std::vector<char*> cargs;
+        for (auto &s : args) cargs.push_back(const_cast<char*>(s.c_str()));
+        cargs.push_back(nullptr);
+        execvp(cargs[0], cargs.data());
+        exit(1);
+    } else {
+        int status;
+        waitpid(pid, &status, 0);
+    }
+}
+
+std::vector<std::string> split(const std::string& str, char delim=' ') {
+    std::vector<std::string> tokens;
+    std::stringstream ss(str);
+    std::string temp;
+    while (std::getline(ss, temp, delim)) if (!temp.empty()) tokens.push_back(temp);
+    return tokens;
 }
 
 int main() {
     std::string line;
     while (true) {
-        std::cout << " "<< std::flush;
-        if (!std::getline(std::cin, line)) {
-            std::cout << "\n";
-            break;
-        }
-        size_t start = line.find_first_not_of(" \t\r\n");
-        if (start == std::string::npos) continue;
-        size_t end = line.find_last_not_of(" \t\r\n");
-        std::string cmdline = line.substr(start, end - start + 1);
-        if (cmdline.empty()) continue;
+        std::cout << "shell> ";
+        std::getline(std::cin, line);
+        if (line.empty()) continue;
+        if (line == "exit") break;
 
-        std::vector<std::string> tokens;
-        split_tokens(cmdline, tokens);
-        if (tokens.empty()) continue;
-        if (tokens[0] == "exit") return 0;
+        std::vector<std::string> semi_cmds = split(line, ';');
+        for (auto &cmd_str : semi_cmds) {
+            std::vector<std::string> tokens = split(cmd_str);
+            bool run_next = true;
+            for (size_t i = 0; i < tokens.size();) {
+                if (!run_next) break;
+                bool silent = false;
+                std::string outfile;
+                bool append = false;
+                std::vector<std::string> args;
 
-        bool silent = false;
-        if (tokens[0] == "silent") {
-            silent = true;
-            tokens.erase(tokens.begin());
-            if (tokens.empty()) continue;
-        }
+                if (tokens[i] == "silent") { silent = true; ++i; }
 
-        std::vector<char*> argv;
-        for (auto &s : tokens) argv.push_back(const_cast<char*>(s.c_str()));
-        argv.push_back(nullptr);
+                while (i < tokens.size() && tokens[i] != "&&" && tokens[i] != "||") {
+                    if (tokens[i] == ">") { ++i; if (i < tokens.size()) { outfile = tokens[i]; append = false; ++i; } }
+                    else if (tokens[i] == ">>") { ++i; if (i < tokens.size()) { outfile = tokens[i]; append = true; ++i; } }
+                    else { args.push_back(tokens[i]); ++i; }
+                }
 
-        pid_t pid = fork();
-        if (pid < 0) {
-            perror("fork");
-            continue;
-        }
+                if (!args.empty()) execute_command(args, silent, outfile, append);
 
-        if (pid == 0) {
-            char cwd[PATH_MAX];
-            if (getcwd(cwd, sizeof(cwd)) != nullptr) {
-                const char *oldpath = getenv("PATH");
-                std::string newpath = oldpath ? std::string(cwd) + ":" + oldpath : std::string(cwd);
-                setenv("PATH", newpath.c_str(), 1);
-            }
-
-            if (silent) {
-                pid_t mypid = getpid();
-                char fname[64];
-                snprintf(fname, sizeof(fname), "%d.log", (int)mypid);
-                int fd = open(fname, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                if (fd != -1) {
-                    dup2(fd, STDOUT_FILENO);
-                    dup2(fd, STDERR_FILENO);
-                    if (fd > 2) close(fd);
+                if (i < tokens.size()) {
+                    std::string op = tokens[i]; ++i;
+                    int last_status = 0; 
+                    if (op == "&&") run_next = (last_status == 0);
+                    else if (op == "||") run_next = (last_status != 0);
                 }
             }
-            execvp(argv[0], argv.data());
-            perror("execvp");
-            _exit(127);
-        } else {
-            int status = 0;
-            waitpid(pid, &status, 0);
-            if (WIFEXITED(status))
-                std::cout << "Command exited" << WEXITSTATUS(status) << "\n";
-            else if (WIFSIGNALED(status))
-                std::cout << "signal " << WTERMSIG(status) << "\n";
-            else
-                std::cout << "abnormally\n";
         }
     }
     return 0;
